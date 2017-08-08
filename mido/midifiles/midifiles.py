@@ -20,6 +20,7 @@ import io
 import time
 import string
 import struct
+import enum
 from numbers import Integral
 
 from ..messages import Message, SPEC_BY_STATUS
@@ -27,12 +28,13 @@ from .meta import (MetaMessage, build_meta_message, meta_charset,
                    encode_variable_int)
 
 from .tracks import MidiTrack, merge_tracks, fix_end_of_track
-from .units import tick2second
+from .units import tick2second, ticks2beats
 
 # The default tempo is 120 BPM.
 # (500000 microseconds per beat (quarter note).)
 DEFAULT_TEMPO = 500000
 DEFAULT_TICKS_PER_BEAT = 480
+DEFAULT_TIME_SIGNATURE = (4, 4)
 
 # Maximum message length to attempt to read.
 MAX_MESSAGE_LENGTH = 1000000
@@ -277,6 +279,18 @@ def get_seconds_per_tick(tempo, ticks_per_beat):
     return (tempo / 1000000.0) / ticks_per_beat
 
 
+class TimingReference(enum.Enum):
+    relative = 0
+    absolute = 1
+
+
+class TimingUnit(enum.Enum):
+    ticks = 0
+    beats = 1
+    seconds = 2
+    milliseconds = 3
+
+
 class MidiFile(object):
     def __init__(self, filename=None, file=None,
                  type=1, ticks_per_beat=DEFAULT_TICKS_PER_BEAT,
@@ -351,24 +365,49 @@ class MidiFile(object):
         return sum(msg.time for msg in self)
 
     def __iter__(self):
+        return self.iter()
+
+    def iter(self, reference=TimingReference.relative, unit=TimingUnit.seconds):
         # The tracks of type 2 files are not in sync, so they can
         # not be played back like this.
         if self.type == 2:
             raise TypeError("can't merge tracks in type 2 (asynchronous) file")
 
         tempo = DEFAULT_TEMPO
+        time_signature = DEFAULT_TIME_SIGNATURE
+        cum_time = 0
         for msg in merge_tracks(self.tracks):
             # Convert message time from absolute time
             # in ticks to relative time in seconds.
             if msg.time > 0:
-                delta = tick2second(msg.time, self.ticks_per_beat, tempo)
+                time = {
+                    TimingUnit.beats: lambda: ticks2beats(msg.time,
+                                                          self.ticks_per_beat,
+                                                          time_signature),
+                    TimingUnit.milliseconds: lambda: 1000*tick2second(msg.time,
+                                                                      self.ticks_per_beat,
+                                                                      tempo,
+                                                                      time_signature),
+                    TimingUnit.seconds: lambda: tick2second(msg.time,
+                                                            self.ticks_per_beat,
+                                                            tempo,
+                                                            time_signature),
+                    TimingUnit.ticks: lambda: msg.time,
+                }[unit]()
             else:
-                delta = 0
+                time = 0
 
-            yield msg.copy(time=delta)
+            cum_time += {
+                TimingReference.absolute: lambda: time,
+                TimingReference.relative: lambda: time - cum_time,
+            }[reference]()
+
+            yield msg.copy(time=cum_time)
 
             if msg.type == 'set_tempo':
                 tempo = msg.tempo
+            elif msg.type == 'time_signature':
+                time_signature = (msg.numerator, msg.denominator)
 
     def play(self, meta_messages=False):
         """Play back all tracks.
